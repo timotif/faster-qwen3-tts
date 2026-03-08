@@ -25,8 +25,12 @@ Usage:
 Voices config (voices.json):
     {
         "alloy": {"ref_audio": "voice.wav", "ref_text": "...", "language": "English"},
-        "echo":  {"ref_audio": "voice2.wav", "ref_text": "...", "language": "English"}
+        "echo":  {"ref_audio": "voice2.wav", "ref_text": "...", "language": "English"},
+        "preset_voice": {"preset": "path/to/preset.pt", "language": "English"}
     }
+
+    When using "preset", the .pt file should contain a voice_clone_prompt dict
+    (as saved by Qwen3TTS.create_voice_preset with x_vector_only_mode=True).
 
 API usage:
     curl -s http://localhost:8000/v1/audio/speech \\
@@ -163,6 +167,17 @@ def resolve_voice(voice_name: str) -> dict:
     )
 
 
+def _voice_kwargs(voice_cfg: dict, text: str) -> dict:
+    """Build kwargs for generate_voice_clone / generate_voice_clone_streaming."""
+    kw = dict(text=text, language=voice_cfg.get("language", "Auto"))
+    if "_voice_clone_prompt" in voice_cfg:
+        kw["voice_clone_prompt"] = voice_cfg["_voice_clone_prompt"]
+    else:
+        kw["ref_audio"] = voice_cfg["ref_audio"]
+        kw["ref_text"] = voice_cfg.get("ref_text", "")
+    return kw
+
+
 # ---------------------------------------------------------------------------
 # Streaming helper: run sync generator in a background thread
 # ---------------------------------------------------------------------------
@@ -179,14 +194,10 @@ async def _stream_chunks(voice_cfg: dict, text: str) -> AsyncGenerator[bytes, No
     def producer():
         try:
             with _model_lock:
-                for chunk, _sr, _timing in tts_model.generate_voice_clone_streaming(
-                    text=text,
-                    language=voice_cfg.get("language", "Auto"),
-                    ref_audio=voice_cfg["ref_audio"],
-                    ref_text=voice_cfg.get("ref_text", ""),
-                    chunk_size=voice_cfg.get("chunk_size", 12),
-                    non_streaming_mode=False,
-                ):
+                kw = _voice_kwargs(voice_cfg, text)
+                kw["chunk_size"] = voice_cfg.get("chunk_size", 12)
+                kw["non_streaming_mode"] = False
+                for chunk, _sr, _timing in tts_model.generate_voice_clone_streaming(**kw):
                     q.put(chunk)
         except Exception as exc:
             q.put(exc)
@@ -244,12 +255,7 @@ async def create_speech(req: SpeechRequest):
 
         def _generate():
             with _model_lock:
-                return tts_model.generate_voice_clone(
-                    text=req.input,
-                    language=voice_cfg.get("language", "Auto"),
-                    ref_audio=voice_cfg["ref_audio"],
-                    ref_text=voice_cfg.get("ref_text", ""),
-                )
+                return tts_model.generate_voice_clone(**_voice_kwargs(voice_cfg, req.input))
 
         audio_arrays, sr = await loop.run_in_executor(None, _generate)
         audio = audio_arrays[0] if audio_arrays else np.zeros(1, dtype=np.float32)
@@ -318,6 +324,13 @@ def main():
     if args.voices:
         with open(args.voices) as f:
             voices = json.load(f)
+        # Preload .pt presets into memory
+        for name, cfg in voices.items():
+            if "preset" in cfg:
+                preset_path = cfg["preset"]
+                data = torch.load(preset_path, weights_only=False)
+                cfg["_voice_clone_prompt"] = data
+                logger.info("Preloaded preset %r from %s", name, preset_path)
         default_voice = next(iter(voices))
         logger.info("Loaded %d voice(s) from %s", len(voices), args.voices)
     elif args.ref_audio:

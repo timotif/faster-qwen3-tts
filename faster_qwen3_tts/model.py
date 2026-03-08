@@ -180,12 +180,13 @@ class FasterQwen3TTS:
     def _prepare_generation(
         self,
         text: str,
-        ref_audio: Union[str, Path],
-        ref_text: str,
-        language: str,
+        ref_audio: Union[str, Path, None] = None,
+        ref_text: str = "",
+        language: str = "Auto",
         xvec_only: bool = True,
         non_streaming_mode: bool = False,
         append_silence: bool = True,
+        voice_clone_prompt: Optional[dict] = None,
     ):
         """Prepare inputs for generation (shared by streaming and non-streaming).
 
@@ -194,14 +195,32 @@ class FasterQwen3TTS:
                 cloning instead of the full ICL acoustic prompt. This prevents the model from
                 continuing the reference audio's last phoneme and allows natural language switching.
                 When False, the full reference audio codec tokens are included in context (ICL mode).
+            voice_clone_prompt: Pre-built voice clone prompt dict. When provided, ref_audio and
+                ref_text are ignored and no audio processing is performed. The dict should have
+                the structure: {ref_code, ref_spk_embedding, x_vector_only_mode, icl_mode}.
         """
         input_texts = [self.model._build_assistant_text(text)]
         input_ids = self.model._tokenize_texts(input_texts)
 
-        cache_key = (str(ref_audio), ref_text, xvec_only, append_silence)
-        if cache_key in self._voice_prompt_cache:
+        if voice_clone_prompt is not None:
+            vcp = voice_clone_prompt
+            # Move tensors to model device if needed
+            device = self.device
+            if vcp["ref_spk_embedding"][0] is not None:
+                vcp["ref_spk_embedding"] = [vcp["ref_spk_embedding"][0].to(device)]
+            if vcp.get("ref_code") and vcp["ref_code"][0] is not None:
+                vcp["ref_code"] = [vcp["ref_code"][0].to(device)]
+            ref_ids = [None] * len(input_ids)
+            # Determine xvec_only from the prompt itself
+            xvec_only = vcp.get("x_vector_only_mode", [True])[0]
+        elif ref_audio is None:
+            raise ValueError("Either ref_audio or voice_clone_prompt must be provided")
+
+        elif (str(ref_audio), ref_text, xvec_only, append_silence) in self._voice_prompt_cache:
+            cache_key = (str(ref_audio), ref_text, xvec_only, append_silence)
             vcp, ref_ids = self._voice_prompt_cache[cache_key]
         elif xvec_only:
+            cache_key = (str(ref_audio), ref_text, xvec_only, append_silence)
             prompt_items = self.model.create_voice_clone_prompt(
                 ref_audio=str(ref_audio),
                 ref_text="",
@@ -217,6 +236,7 @@ class FasterQwen3TTS:
             ref_ids = [None] * len(input_ids)
             self._voice_prompt_cache[cache_key] = (vcp, ref_ids)
         else:
+            cache_key = (str(ref_audio), ref_text, xvec_only, append_silence)
             silence_secs = 0.5 if append_silence else 0.0
             ref_audio_input = self._load_ref_audio_with_silence(ref_audio, silence_secs=silence_secs)
             prompt_items = self.model.create_voice_clone_prompt(
@@ -527,8 +547,8 @@ class FasterQwen3TTS:
         self,
         text: str,
         language: str,
-        ref_audio: Union[str, Path],
-        ref_text: str,
+        ref_audio: Union[str, Path, None] = None,
+        ref_text: str = "",
         max_new_tokens: int = 2048,
         min_new_tokens: int = 2,
         temperature: float = 0.9,
@@ -539,14 +559,15 @@ class FasterQwen3TTS:
         xvec_only: bool = True,
         non_streaming_mode: bool = True,
         append_silence: bool = True,
+        voice_clone_prompt: Optional[dict] = None,
     ) -> Tuple[list, int]:
         """
-        Generate speech with voice cloning using reference audio.
+        Generate speech with voice cloning using reference audio or a pre-built prompt.
 
         Args:
             text: Text to synthesize
             language: Target language
-            ref_audio: Path to reference audio file
+            ref_audio: Path to reference audio file. Not required when voice_clone_prompt is provided.
             ref_text: Transcription of reference audio
             max_new_tokens: Maximum tokens to generate
             min_new_tokens: Minimum tokens before EOS is allowed
@@ -559,6 +580,8 @@ class FasterQwen3TTS:
                 This prevents phoneme bleed-through from the reference and allows clean
                 language switching. Set to False for full ICL mode (reference audio in context).
             non_streaming_mode: Match upstream non-streaming prompt layout. Default True for better non-streaming quality.
+            voice_clone_prompt: Pre-built voice clone prompt dict (e.g. loaded from a .pt preset).
+                When provided, ref_audio and ref_text are ignored.
 
         Returns:
             Tuple of ([audio_waveform], sample_rate)
@@ -573,6 +596,7 @@ class FasterQwen3TTS:
             xvec_only=xvec_only,
             non_streaming_mode=non_streaming_mode,
             append_silence=append_silence,
+            voice_clone_prompt=voice_clone_prompt,
         )
 
         codec_ids, timing = fast_generate(
@@ -638,8 +662,8 @@ class FasterQwen3TTS:
         self,
         text: str,
         language: str,
-        ref_audio: Union[str, Path],
-        ref_text: str,
+        ref_audio: Union[str, Path, None] = None,
+        ref_text: str = "",
         max_new_tokens: int = 2048,
         min_new_tokens: int = 2,
         temperature: float = 0.9,
@@ -652,6 +676,7 @@ class FasterQwen3TTS:
         non_streaming_mode: bool = True,
         append_silence: bool = True,
         parity_mode: bool = False,
+        voice_clone_prompt: Optional[dict] = None,
     ) -> Generator[Tuple[np.ndarray, int, dict], None, None]:
         """
         Stream voice-cloned speech generation, yielding audio chunks.
@@ -662,7 +687,7 @@ class FasterQwen3TTS:
         Args:
             text: Text to synthesize
             language: Target language
-            ref_audio: Path to reference audio file
+            ref_audio: Path to reference audio file. Not required when voice_clone_prompt is provided.
             ref_text: Transcription of reference audio
             max_new_tokens: Maximum tokens to generate
             min_new_tokens: Minimum tokens before EOS is allowed
@@ -678,6 +703,8 @@ class FasterQwen3TTS:
             non_streaming_mode: When True (default), prefill the full target text before
                 streaming decode. Set to False to feed text token-by-token during decode.
             parity_mode: When True, disables CUDA graphs and uses dynamic cache streaming.
+            voice_clone_prompt: Pre-built voice clone prompt dict (e.g. loaded from a .pt preset).
+                When provided, ref_audio and ref_text are ignored.
 
         Yields:
             Tuple of (audio_chunk_numpy, sample_rate, timing_dict)
@@ -692,6 +719,7 @@ class FasterQwen3TTS:
             xvec_only=xvec_only,
             non_streaming_mode=non_streaming_mode,
             append_silence=append_silence,
+            voice_clone_prompt=voice_clone_prompt,
         )
 
         speech_tokenizer = m.speech_tokenizer
