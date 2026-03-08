@@ -204,15 +204,17 @@ class FasterQwen3TTS:
 
         if voice_clone_prompt is not None:
             vcp = voice_clone_prompt
+            if not vcp.get("x_vector_only_mode", [True])[0]:
+                raise ValueError(
+                    "ICL-mode presets are not supported via voice_clone_prompt. "
+                    "Use an x-vector-only preset, or pass ref_audio/ref_text directly."
+                )
             # Move tensors to model device if needed
             device = self.device
             if vcp["ref_spk_embedding"][0] is not None:
                 vcp["ref_spk_embedding"] = [vcp["ref_spk_embedding"][0].to(device)]
-            if vcp.get("ref_code") and vcp["ref_code"][0] is not None:
-                vcp["ref_code"] = [vcp["ref_code"][0].to(device)]
             ref_ids = [None] * len(input_ids)
-            # Determine xvec_only from the prompt itself
-            xvec_only = vcp.get("x_vector_only_mode", [True])[0]
+            xvec_only = True
         elif ref_audio is None:
             raise ValueError("Either ref_audio or voice_clone_prompt must be provided")
 
